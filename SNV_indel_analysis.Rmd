@@ -1,0 +1,493 @@
+---
+title: "Analysis of mutations in HL exomes"
+author: "Stacy Hung"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+To avoid memory errors, files have been pre-filtered using the following thresholds:
+* Mutect  - predictions that have a "KEEP" flag (i.e. remove those that have a "REJECT" flag)
+* Strelka - "passed" predictions (passed.somatic.snvs.vcf, passed.somatic.indels.vcf)
+* VarScan - removal of predictions labelled with the effect "INTRON", "INTRAGENIC", "\tSYNONYMOUS_CODING"
+
+NEW thresholds / filters (for SNV calling only):
+*1. Only keep variants with a somatic p-value < 0.05
+*2. Minimum variant reads = 3
+*3. Minimum allele frequency = 5%
+
+## ###############################################################################################
+## Load and process datasets for paired T-N analysis (VarScan paired, MuTect, Strelka)
+## ###############################################################################################
+
+```{r}
+library(dplyr)    # filter
+library(tidyr)    # separate
+
+#**************
+#*  VARSCAN   *
+#**************
+varscan.paired.snvs <- read.table("/Volumes/shung/projects/HL_Tomo/WES/HL_NextSeq_20190201/varScan/all.paired_samples.varScan.snps.filtered.txt", sep = "\t", header = TRUE, fill = TRUE)
+varscan.paired.indels <- read.table("/Volumes/shung/projects/HL_Tomo/WES/HL_NextSeq_20190201/varScan/all.paired_samples.varScan.indels.filtered.txt", sep = "\t", header = TRUE, fill = TRUE)
+
+# combine snvs and indel - add mutation type as separate "type" column
+varscan.paired.snvs$type = "snv"
+varscan.paired.indels$type = "indel"
+varscan.paired.calls <- rbind(varscan.paired.snvs, varscan.paired.indels)
+
+rm(varscan.paired.snvs)
+rm(varscan.paired.indels)
+
+# rename columns
+colnames(varscan.paired.calls) <- c("sample", "chr", "pos", "external_id", "ref", "alt", "qual", "filter",
+                            "depth", "somatic_status", "ssc", "gpv", "somatic_p_value", "cda",
+                            "KG_validated", "om", "pm", "gmaf", "gt_normal", "gt_tumor", "gq_normal", "gq_tumor",
+                            "depth_normal", "depth_tumor", "ref_reads_normal", "ref_reads_tumor",
+                            "var_reads_normal", "var_reads_tumor", "allele_freq_normal", "allele_freq_tumor",
+                            "depth4_normal", "depth4_tumor", "effect", "impact", "fun_class", "HGVS_DNA",
+                            "HGVS_protein", "gene", "biotype", "coding", "transcript_id", "exon_rank", "type")
+
+# create a tumor_id column based on the sample id (format is <tumor_id>_<normal_id>) - e.g. GE0556B_GE0556-N
+varscan.paired.calls$tumor_id <- gsub("(.*)\\_(.*)","\\1", varscan.paired.calls$sample)
+# after merging with strelka calls, we will need to remove the scroll identifier (e.g. A, B, etc.)
+
+# remove ".markDups" from the tumor ids
+varscan.paired.calls$tumor_id <- gsub("(.*)\\.markDups(.*)","\\1", varscan.paired.calls$tumor_id)
+
+# remove "%" from the allele frequency
+varscan.paired.calls$allele_freq_normal <- gsub("(.*)\\%(.*)","\\1", varscan.paired.calls$allele_freq_normal)
+varscan.paired.calls$allele_freq_tumor <- gsub("(.*)\\%(.*)","\\1", varscan.paired.calls$allele_freq_tumor)
+
+# filter for somatic calls (SS = 2 and GMAF [if available] is not greater than 0.01)
+varscan.paired.calls <- filter(varscan.paired.calls, somatic_status == 2 & filter == 'PASS' & (as.numeric(gmaf) < 0.001 | is.na(gmaf)))
+
+# filter calls based on somatic p-value
+varscan.paired.calls <- filter(varscan.paired.calls, as.numeric(somatic_p_value) <= 0.05)
+
+# filter calls based on minimum variant reads
+varscan.paired.calls <- filter(varscan.paired.calls, as.numeric(var_reads_tumor) >= 3)
+
+# filter calls based on minimum allele frequency
+varscan.paired.calls <- filter(varscan.paired.calls, as.numeric(allele_freq_tumor) >= 5)
+
+# filter on maximum 5% of tumor reads in tumor
+varscan.paired.calls <- filter(varscan.paired.calls, as.numeric(allele_freq_normal) <= 0.05*as.numeric(var_reads_tumor))
+
+# remove unneeded columns and rearrange as necessary
+# last few columns are for initial filtering and reference and can be removed later
+keeps <- c("tumor_id", "type", "chr", "pos", "gene", "ref", "alt", "HGVS_DNA", "HGVS_protein",
+           "allele_freq_normal", "allele_freq_tumor", "depth4_normal", "depth4_tumor", 
+           "var_reads_normal", "var_reads_tumor", "effect", "impact", "fun_class", "transcript_id",
+           "external_id", "somatic_p_value", "somatic_status", "gt_normal", "gt_tumor")
+varscan.paired.calls <- varscan.paired.calls[keeps]
+
+# filter HGVS calls for obvious effects
+varscan.paired.calls <- unique(rbind(
+                varscan.paired.calls[grep("FRAME_SHIFT", varscan.paired.calls$effect), ],
+                varscan.paired.calls[grep("SPLICE_SITE_ACCEPTOR", varscan.paired.calls$effect), ],
+                varscan.paired.calls[grep("SPLICE_SITE_DONOR", varscan.paired.calls$effect), ],
+                varscan.paired.calls[grep("CODON_CHANGE_PLUS_CODON_DELETION", varscan.paired.calls$effect), ],
+                varscan.paired.calls[grep("CODON_DELETION", varscan.paired.calls$effect), ],
+                varscan.paired.calls[grep("CODON_INSERTION", varscan.paired.calls$effect), ],
+                varscan.paired.calls[grep("NON_SYNONYMOUS_CODING", varscan.paired.calls$effect), ],
+                varscan.paired.calls[grep("NON_SYNONYMOUS_START", varscan.paired.calls$effect), ],
+                varscan.paired.calls[grep("START_GAINED", varscan.paired.calls$effect), ],
+                varscan.paired.calls[grep("START_LOST", varscan.paired.calls$effect), ],
+                varscan.paired.calls[grep("STOP_GAINED", varscan.paired.calls$effect), ],
+                varscan.paired.calls[grep("STOP_LOST", varscan.paired.calls$effect), ],
+                varscan.paired.calls[grep("UTR_3_PRIME", varscan.paired.calls$effect), ],
+                varscan.paired.calls[grep("UTR_5_PRIME", varscan.paired.calls$effect), ]
+                ))
+varscan.paired.calls$effect <- factor(varscan.paired.calls$effect)
+
+# other effects to include:
+# SPLICE_SITE_REGION ? [IMPACT: LOW] - desc: A sequence variant in which a change has occurred within the region of the splice site, either within 1-3 bases of the exon or 3-8 bases of the intron.
+# EXON ? [IMPACT: MODIFIER] - desc: The variant hits an exon (from a non-coding transcript) or a retained intron.
+# SYNONYMOUS_STOP? [IMPACT: LOW] - desc: Variant causes stop codon to be mutated into another stop codon. e.g.: taA/taG, */*
+
+varscan.paired.calls$combine = as.character(paste(
+  varscan.paired.calls$tumor_id, 
+  varscan.paired.calls$chr, 
+  varscan.paired.calls$pos, 
+  varscan.paired.calls$ref,
+  varscan.paired.calls$alt,
+  sep = "."
+  ))
+
+# sort the calls by case, chr, then position
+varscan.paired.calls <- arrange(varscan.paired.calls, tumor_id, chr, pos)
+
+# print out the results (these will be VarScan not intersected with any other methods)
+write.table(varscan.paired.calls, "/Volumes/shung/projects/HL_Tomo/WES/HL_NextSeq_20190201/varScan/varScan.all.paired-snps_and_indels.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+
+
+#**************
+#*   MUTECT   *
+#**************
+
+# NB: the raw output file first needs to be cleaned up (includes extra headers from every tumor file), and will also include file names from performing an egrep on multiple files.  This can be done quickly in the command line environment.
+mutect.snvs <- read.table("/Volumes/shung/projects/HL_Tomo/WES/HL_NextSeq_20190201/mutect/mutect.all.snps.pass.txt", sep = "\t", header = TRUE)
+
+mutect.snvs$combine = as.character(paste(
+  mutect.snvs$tumor_name,
+  mutect.snvs$contig,
+  mutect.snvs$position,
+  mutect.snvs$ref_allele,
+  mutect.snvs$alt_allele,
+  sep = "."
+))
+
+mutect.snvs$type = "snv"
+
+#**************
+#*  STRELKA   *
+#**************
+strelka.snvs <- read.table("/Volumes/shung/projects/HL_Tomo/WES/HL_NextSeq_20190201/strelka/passed.snvs.txt", sep = "\t", header = FALSE)
+strelka.indels <- read.table("/Volumes/shung/projects/HL_Tomo/WES/HL_NextSeq_20190201/strelka/passed.indels.txt", sep = "\t", header = FALSE)
+
+# combine snvs and indels - add mutation type as separate "type" column
+strelka.indels$type = "indel"
+strelka.snvs$type = "snv"
+strelka.calls <- rbind(strelka.indels, strelka.snvs)
+
+rm(strelka.indels)
+rm(strelka.snvs)
+
+# extract only columns of interest
+strelka.calls <- strelka.calls[,c("V1", "V2", "V3", "V5", "V6", "type")]
+
+# assign column names to strelka datasets
+colnames(strelka.calls) <- c("sample", "chr", "pos", "ref", "alt", "type")
+
+# remove ".markDups" from the tumor ids
+strelka.calls$sample <- gsub("(.*)\\.markDups(.*)","\\1", strelka.calls$sample)
+
+strelka.calls$combine = as.character(paste(
+  strelka.calls$sample,
+  strelka.calls$chr,
+  strelka.calls$pos,
+  strelka.calls$ref,
+  strelka.calls$alt,
+  sep = "."
+))
+
+# Find the intersection of varscan (snvs), mutect, and strelka (snvs).
+combine.varscan.intersect.strelka <- intersect(unique(varscan.paired.calls$combine), unique(strelka.calls$combine))
+combine.intersect.all <- intersect(unique(combine.varscan.intersect.strelka), unique(mutect.snvs$combine))
+snvs.intersect.all <- subset(varscan.paired.calls, varscan.paired.calls$combine %in% combine.intersect.all)
+snvs.intersect.all$evidence <- "mutect, strelka, varscan"
+#
+# add indels
+# Take the intersect of indels from varscan and strelka indel calls.
+varscan.indels <- subset(varscan.paired.calls, varscan.paired.calls$type == 'indel')
+strelka.indels <- subset(strelka.calls, strelka.calls$type == 'indel')
+combine.varscan.intersect.strelka <- intersect(unique(varscan.indels$combine), unique(strelka.indels$combine))
+indels.intersect.all <- subset(varscan.paired.calls, varscan.paired.calls$combine %in% combine.varscan.intersect.strelka)
+indels.intersect.all$evidence <- "strelka, varscan"
+
+# now combine snvs and indels
+calls.all <- rbind(snvs.intersect.all, indels.intersect.all)
+
+rm(varscan.paired.calls)
+rm(strelka.calls)
+rm(mutect.snvs)
+rm(combine.varscan.intersect.strelka)
+rm(combine.intersect.all)
+rm(snvs.intersect.all)
+rm(varscan.indels)
+rm(strelka.indels)
+rm(indels.intersect.all)
+
+# remove NA's and blanks for functional class
+calls.all$fun_class[calls.all$fun_class==""] <- "NONE"
+calls.all$fun_class[is.na(calls.all$fun_class)] <- "NONE"
+
+# remove the "combine" and "tumor_id" column, and rearrange columns in the process
+keeps <- c("tumor_id", "type", "chr", "pos", "gene", "ref", "alt", "HGVS_DNA", "HGVS_protein",
+           "allele_freq_normal", "allele_freq_tumor", "depth4_normal", "depth4_tumor", 
+           "var_reads_normal", "var_reads_tumor", "effect", "impact", "fun_class", "transcript_id",
+           "external_id", "somatic_p_value", "somatic_status", "gt_normal", "gt_tumor", "evidence")
+
+calls.all <- calls.all[keeps]
+
+# sort the calls by case, chr, then position
+calls.all <- unique(arrange(calls.all, tumor_id, chr, pos))
+
+# write the results to a text file
+write.table(calls.all, "/Volumes/shung/projects/HL_Tomo/WES/HL_NextSeq_20190201/snv_indel_analysis/snvs_indels.all.intersect.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## ###############################################################################################
+## Visualization
+## ###############################################################################################
+
+```{r}
+library(plyr)
+library(ggplot2)
+library(dplyr)
+
+# read in calls for previously analyzed sample (merged LMD04 vs. const)
+calls.part1 <- read.table("/Volumes/shung/projects/HL_Tomo/WES/ctDNA_candidates/snv_analysis/snvs.all.intersect.txt", sep = "\t", header = TRUE, fill = TRUE)
+
+# extract only calls for the samples of interest
+calls.part1 <- filter(calls.part1, calls.part1$tumor_id %in% c("cHL-LMD04-HRS-merged"))
+calls.part1$tumor_id <- factor(calls.part1$tumor_id)
+
+calls.part2 <- read.table("/Volumes/shung/projects/HL_Tomo/WES/HL_NextSeq_20190201/snv_indel_analysis/snvs_indels.all.intersect.txt", sep = "\t", header = TRUE, fill = TRUE)
+
+calls.all <- rbind (calls.part1, calls.part2)
+
+calls.all$class <- revalue(calls.all$effect, c("NON_SYNONYMOUS_CODING"="Missense", 
+                           "NON_SYNONYMOUS_START"="Missense",
+                           "START_LOST"="Start Lost",
+                           "STOP_LOST"="Missense",
+                           "STOP_GAINED"="Nonsense",
+                           "CODON_CHANGE_PLUS_CODON_DELETION"="In-frame Indel",
+                           "CODON_CHANGE_PLUS_CODON_INSERTION"="In-frame Indel",
+                           "CODON_DELETION"="In-frame Indel",
+                           "CODON_INSERTION"="In-frame Indel",
+                           "FRAME_SHIFT"="Frameshift Indel",
+                           "FRAME_SHIFT+SPLICE_SITE_ACCEPTOR"="Frameshift Indel",
+                           "FRAME_SHIFT+SPLICE_SITE_DONOR"="Frameshift Indel",
+                           "FRAME_SHIFT+STOP_GAINED"="Frameshift Indel",
+                           "SPLICE_SITE_ACCEPTOR+CODON_CHANGE_PLUS_CODON_DELETION"="In-frame Indel",
+                           "SPLICE_SITE_DONOR+CODON_CHANGE_PLUS_CODON_DELETION"="In-frame Indel",
+                           "STOP_LOST+CODON_DELETION"="In-frame Indel",
+                           "SPLICE_SITE_ACCEPTOR"="Splice site",
+                           "SPLICE_SITE_DONOR"="Splice site",
+                           "UTR_3_PRIME"="3' UTR",
+                           "UTR_5_PRIME"="5' UTR"
+                           ))
+
+data.df <- as.data.frame(table(calls.all$tumor_id, calls.all$class))
+colnames(data.df) <- c("sample", "variant_class", "count")
+
+# specify ordering of tumor samples
+samples <- c("cHL-LMD04-HRS-merged", "CHL-SORT-26HRS-DNA", "CHL-SORT-24HRS-DNA", "CHL-SORT-25HRS-DNA")
+p <- ggplot(theTable, aes(x = Position)) + scale_x_discrete(limits = positions)
+
+ggplot(data = data.df, aes(x = sample, y = count, fill = variant_class)) + 
+  geom_bar(stat = "identity", width = 0.6) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  scale_fill_brewer(name = "Variant Class", palette="Spectral") +
+  scale_x_discrete(limits = samples) +
+  xlab("") + ylab("Number of Mutations")
+
+# horizontal barplot
+ggplot(data = data.df, aes(x = sample, y = count, fill = variant_class)) + 
+  geom_bar(stat = "identity", width = 0.6) + 
+  xlab("") + ylab("Mutations") +
+  coord_flip() +
+  scale_x_discrete(limits = samples) +
+  scale_fill_brewer(palette="Spectral")
+
+
+# horizontal barplot with numbers of mutations
+
+data.total_counts <- as.data.frame(table(calls.all$tumor_id))
+colnames(data.total_counts) <- c("sample", "count")
+
+ggplot(data = data.total_counts, aes(x = sample, y = count)) + 
+  geom_bar(stat = "identity", width = 0.6) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  xlab("") + ylab("Mutations") +
+  coord_flip() +
+  geom_text(aes(label=count), hjust=-0.25)
+
+```
+
+## Allele frequency
+
+```{r}
+library(gridExtra)
+library(gtable)
+library(ggplot2)
+
+# first specify the order for which the tumor samples are factored
+samples <- factor(c("cHL-LMD04-HRS-merged", "CHL-SORT-26HRS-DNA", "CHL-SORT-24HRS-DNA", "CHL-SORT-25HRS-DNA"))
+calls.all$tumor_id <- factor(calls.all$tumor_id, levels = c("cHL-LMD04-HRS-merged", "CHL-SORT-26HRS-DNA", "CHL-SORT-24HRS-DNA", "CHL-SORT-25HRS-DNA"))
+
+# for each sample, create AF density plot with vertical at peak value
+AF.plots <- vector('list', length(samples))
+for (i in seq_along(samples)) {
+  temp <- subset(calls.all, calls.all$tumor_id == samples[i])
+  
+  num_mutations <- nrow(temp)
+  
+  # identify peak value for current sample
+  max_y_density <- which.max(density(temp$allele_freq_tumor)$y)
+  max_x_intercept <- density(temp$allele_freq_tumor)$x[max_y_density]
+  max_y_intercept <- density(temp$allele_freq_tumor)$y[max_y_density]
+  
+  print(max_y_intercept)
+  
+  AF.plots[[i]] <- ggplot(temp, aes(as.numeric(allele_freq_tumor))) + 
+    geom_density() +
+    geom_vline(xintercept = max_x_intercept, col="red", lty=2) +
+    xlab("Allele frequency (%)") + ylab("Density") +
+    annotate("text", 
+             y = max_y_intercept+0.2*max_y_intercept,
+             x = max(temp$allele_freq_tumor),
+             label = paste("Peak AF: ", round(max_x_intercept, digits = 2), "%", sep = ""),
+             hjust = 1) + 
+    theme(axis.title.x = element_blank(), axis.title.y = element_blank()) +
+    ylim(0, max_y_intercept+0.25*max_y_intercept) +
+    ggtitle(label = paste(temp$tumor_id, " (n = ", num_mutations, ")", sep = ""))
+}
+#do.call("grid.arrange", c(AF.plots, ncol=1))
+grid.arrange(grobs = AF.plots, ncol=2, bottom = "Allele frequency (%)", left = "Density")
+
+#y = max(density(temp$allele_freq_tumor)$y),
+
+# plot all samples
+p <- ggplot(calls.all, aes(as.numeric(allele_freq_tumor), colour = tumor_id)) + 
+  geom_density() + 
+  xlab ("Allele frequency (%)") + 
+  ylab("Density")
+
+# faceted plot (one distribution per sample)
+p + facet_grid(tumor_id ~ ., scales = "free")
+
+# or organize plots into 2 columns
+p + facet_wrap(~ tumor_id, ncol=2)
+
+```
+
+## Find overlap of mutations between pairs of samples (from the same tumor):
+
+What mutations overlap between cHL-LMD04-HRS-merged and CHL-SORT-26HRS-DNA?
+What mutations overlap between CHL-SORT-24HRS-DNA and CHL-SORT-25HRS-DNA?
+
+```{r}
+library(dplyr)
+
+calls.all$combine = as.character(paste(
+  calls.all$chr,
+  calls.all$pos,
+  calls.all$ref,
+  calls.all$alt,
+  sep = "."
+))
+
+###
+# comparison between cHL-LM04-HRS-merged and CHL-SORT-26HRS-DNA
+###
+
+calls.cHL_LMD04_HRS_merged <- filter(calls.all, calls.all$tumor_id %in% c("cHL-LMD04-HRS-merged"))
+
+calls.cHL_LMD04_HRS_merged$combine = as.character(paste(
+  calls.cHL_LMD04_HRS_merged$chr,
+  calls.cHL_LMD04_HRS_merged$pos,
+  calls.cHL_LMD04_HRS_merged$ref,
+  calls.cHL_LMD04_HRS_merged$alt,
+  sep = "."
+))
+
+calls.CHL_SORT_26HRS_DNA <- filter(calls.all, calls.all$tumor_id %in% c("CHL-SORT-26HRS-DNA"))
+
+calls.CHL_SORT_26HRS_DNA$combine = as.character(paste(
+  calls.CHL_SORT_26HRS_DNA$chr,
+  calls.CHL_SORT_26HRS_DNA$pos,
+  calls.CHL_SORT_26HRS_DNA$ref,
+  calls.CHL_SORT_26HRS_DNA$alt,
+  sep = "."
+))
+
+# Get three datasets of interest - attached "dataset" label to each
+# 1. Mutations that are found in both tumors ("Overlap")
+combine.LM04.intersect.HRS26 <- intersect(unique(calls.cHL_LMD04_HRS_merged$combine), unique(calls.CHL_SORT_26HRS_DNA$combine))
+calls.LMD04.intersect.HRS26 <- subset(calls.CHL_SORT_26HRS_DNA, calls.CHL_SORT_26HRS_DNA$combine %in% combine.LM04.intersect.HRS26)
+calls.LMD04.intersect.HRS26$tumor_id <- "LMD04 and HRS26"
+calls.LMD04.intersect.HRS26$tumor_id <- factor(calls.LMD04.intersect.HRS26$tumor_id)
+calls.LMD04.intersect.HRS26$dataset <- "Overlap"
+
+# 2. Mutations that are found only in LMD04
+calls.unique.LMD04 <- subset(calls.cHL_LMD04_HRS_merged, !(calls.cHL_LMD04_HRS_merged$combine %in% combine.LM04.intersect.HRS26))
+calls.unique.LMD04$tumor_id <- factor(calls.unique.LMD04$tumor_id)
+calls.unique.LMD04$dataset <- "Unique to LMD04"
+
+# 3. Mutations that are found only in HRS26
+calls.unique.HRS26 <- subset(calls.CHL_SORT_26HRS_DNA, !(calls.CHL_SORT_26HRS_DNA$combine %in% combine.LM04.intersect.HRS26))
+calls.unique.HRS26$tumor_id <- factor(calls.unique.HRS26$tumor_id)
+calls.unique.HRS26$dataset <- "Unique to HRS26"
+
+# combine above 3 datasets into one dataframe
+keeps <- c("tumor_id", "type", "effect", "allele_freq_tumor", "dataset")
+calls.LMD04.intersect.HRS26 <- calls.LMD04.intersect.HRS26[keeps]
+calls.unique.LMD04 <- calls.unique.LMD04[keeps]
+calls.unique.HRS26 <- calls.unique.HRS26[keeps]
+calls.combined <- rbind(calls.unique.LMD04, calls.LMD04.intersect.HRS26, calls.unique.HRS26)
+calls.combined$tumor_id <- factor(calls.combined$tumor_id)
+
+write.table(calls.combined, "/Volumes/shung/projects/HL_Tomo/WES/HL_NextSeq_20190201/snv_indel_analysis/LMD04_and_HRS26-snvs_indels-overlap.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+
+# create summary table based on tumor id + dataset type
+#summary.table <- as.data.frame(table(calls.combined$tumor_id, calls.combined$dataset))
+#colnames(summary.table) <- c("sample", "dataset", "num_mutations")
+#dataset.order <- c("Unique to LMD04", "Overlap", "Unique to HRS26")
+#summary.table <- summary.table[order(match(summary.table$dataset, dataset.order)), ]
+#summary.table$dataset <- factor(summary.table$dataset, levels = summary.table$dataset)
+#
+## plot barplot, where fill (stack) of bar is defined by dataset type, each bar is a sample (e.g. GZ149T)
+#p <- ggplot(summary.table, aes(x=sample, y=num_mutations, fill = dataset)) +     
+#  geom_bar(stat = 'identity', width = 0.6) +
+#  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+#  scale_fill_brewer(palette="Set1") +
+#  xlab("") +
+#  ylab("Number of mutations")
+
+
+###
+# comparison between CHL-SORT-24HRS-DNA and CHL-SORT-26HRS-DNA
+###
+
+calls.CHL_SORT_24HRS_DNA <- filter(calls.all, calls.all$tumor_id %in% c("CHL-SORT-24HRS-DNA"))
+
+calls.CHL_SORT_24HRS_DNA$combine = as.character(paste(
+  calls.CHL_SORT_24HRS_DNA$chr,
+  calls.CHL_SORT_24HRS_DNA$pos,
+  calls.CHL_SORT_24HRS_DNA$ref,
+  calls.CHL_SORT_24HRS_DNA$alt,
+  sep = "."
+))
+
+calls.CHL_SORT_25HRS_DNA <- filter(calls.all, calls.all$tumor_id %in% c("CHL-SORT-25HRS-DNA"))
+
+calls.CHL_SORT_25HRS_DNA$combine = as.character(paste(
+  calls.CHL_SORT_25HRS_DNA$chr,
+  calls.CHL_SORT_25HRS_DNA$pos,
+  calls.CHL_SORT_25HRS_DNA$ref,
+  calls.CHL_SORT_25HRS_DNA$alt,
+  sep = "."
+))
+
+# Get three datasets of interest - attached "dataset" label to each
+# 1. Mutations that are found in both 
+combine.HRS24.intersect.HRS25 <- intersect(unique(calls.CHL_SORT_24HRS_DNA$combine), unique(calls.CHL_SORT_25HRS_DNA$combine))
+calls.HRS24.intersect.HRS25 <- subset(calls.CHL_SORT_24HRS_DNA, calls.CHL_SORT_24HRS_DNA$combine %in% combine.HRS24.intersect.HRS25)
+calls.HRS24.intersect.HRS25$tumor_id <- "HRS24 and HRS25"
+calls.HRS24.intersect.HRS25$tumor_id <- factor(calls.HRS24.intersect.HRS25$tumor_id)
+calls.HRS24.intersect.HRS25$dataset <- "Overlap"
+
+# 2. Mutations that are found only in HRS24
+calls.unique.HRS24 <- subset(calls.CHL_SORT_24HRS_DNA, !(calls.CHL_SORT_24HRS_DNA$combine %in% combine.HRS24.intersect.HRS25))
+calls.unique.HRS24$tumor_id <- factor(calls.unique.HRS24$tumor_id)
+calls.unique.HRS24$dataset <- "Unique to HRS24"
+
+# 3. Mutations that are found only in HRS25
+calls.unique.HRS25 <- subset(calls.CHL_SORT_25HRS_DNA, !(calls.CHL_SORT_25HRS_DNA$combine %in% combine.HRS24.intersect.HRS25))
+calls.unique.HRS25$tumor_id <- factor(calls.unique.HRS25$tumor_id)
+calls.unique.HRS25$dataset <- "Unique to HRS25"
+
+# combine above 3 datasets into one dataframe
+keeps <- c("tumor_id", "type", "effect", "allele_freq_tumor", "dataset")
+combine.HRS24.intersect.HRS25 <- combine.HRS24.intersect.HRS25[keeps]
+calls.unique.HRS24 <- calls.unique.HRS24[keeps]
+calls.unique.HRS25 <- calls.unique.HRS25[keeps]
+calls.combined <- rbind(calls.unique.HRS24, combine.HRS24.intersect.HRS25, calls.unique.HRS25)
+calls.combined$tumor_id <- factor(calls.combined$tumor_id)
+
+write.table(calls.combined, "/Volumes/shung/projects/HL_Tomo/WES/HL_NextSeq_20190201/snv_indel_analysis/HRS24_and_HRS25-snvs_indels-overlap.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+
+
+```
